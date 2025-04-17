@@ -1,0 +1,71 @@
+name: Check Lockfile Modification by Author
+
+on:
+  pull_request:
+    branches: [ main ] # Or your main development branch
+
+env:
+  # IMPORTANT: Use the exact committer EMAIL your CI uses when pushing the lockfile
+  # Store this as a GitHub Secret in production environments
+  CI_BOT_EMAIL: 'ci-bot@your-domain.com'
+
+jobs:
+  check-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # Need history to compare commits and check authors
+
+      - name: Check for package-lock.json changes and author
+        run: |
+          # Get the merge base commit sha (common ancestor)
+          MERGE_BASE=$(git merge-base origin/${{ github.base_ref }} HEAD)
+          echo "Comparing PR commits from $MERGE_BASE to HEAD"
+
+          # Check if package-lock.json changed between merge base and HEAD
+          # Using --quiet to suppress output, exit code indicates changes
+          if git diff --quiet --exit-code $MERGE_BASE HEAD -- package-lock.json; then
+            echo "package-lock.json was not modified in this PR. Check passed."
+            exit 0
+          fi
+
+          echo "package-lock.json WAS modified in this PR. Checking authors..."
+
+          # Get list of author emails for commits in the PR range that affected package-lock.json
+          # Use git log with path filter. %ae gives author email.
+          COMMIT_AUTHORS=$(git log --format='%ae' $MERGE_BASE..HEAD -- package-lock.json)
+
+          if [ -z "$COMMIT_AUTHORS" ]; then
+             # Defensive check: diff detected changes, but log found no commits affecting the file?
+             # This might indicate complex history or issues; safer to fail.
+             echo "::error::Inconsistency detected. Diff shows package-lock.json changed, but log found no modifying commits in range."
+             exit 1
+          fi
+
+          echo "Author emails modifying package-lock.json in this PR:"
+          echo "$COMMIT_AUTHORS"
+
+          # Check if ALL authors match the CI bot email
+          ALL_BOT_COMMITS=true
+          while IFS= read -r AUTHOR_EMAIL; do
+            # Trim potential whitespace just in case
+            TRIMMED_AUTHOR_EMAIL=$(echo "$AUTHOR_EMAIL" | xargs)
+            if [[ "$TRIMMED_AUTHOR_EMAIL" != "$CI_BOT_EMAIL" ]]; then
+              ALL_BOT_COMMITS=false
+              echo "::error::Detected modification to package-lock.json by non-CI user: $TRIMMED_AUTHOR_EMAIL"
+              break # Found a non-bot author, no need to check further
+            fi
+          done <<< "$COMMIT_AUTHORS" # Feed the authors list into the loop
+
+          if $ALL_BOT_COMMITS; then
+            echo "All modifications to package-lock.json were made by the CI bot ($CI_BOT_EMAIL). Check passed."
+            exit 0
+          else
+            # Specific failure message for developers
+            echo "::error::Modification of package-lock.json by developers is not allowed in PRs."
+            echo "::error::Please revert the changes to package-lock.json using 'git checkout origin/${{ github.base_ref }} -- package-lock.json' or 'git checkout <commit_before_change> -- package-lock.json', commit the revert, and update your PR."
+            echo "::error::The canonical package-lock.json is managed by the CI pipeline."
+            exit 1
+          fi
